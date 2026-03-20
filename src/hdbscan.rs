@@ -2,6 +2,7 @@
 use crate::core_distances::parallel::CoreDistanceCalculatorPar;
 #[cfg(feature = "serial")]
 use crate::core_distances::serial::CoreDistanceCalculator;
+use crate::cluster_result::HdbscanResult;
 use crate::data_wrappers::{CondensedNode, MSTEdge, SLTNode};
 #[cfg(feature = "parallel")]
 use crate::min_spanning_tree::parallel::PrimsMinSpanningTreePar;
@@ -10,12 +11,19 @@ use crate::min_spanning_tree::serial::PrimsMinSpanningTree;
 use crate::min_spanning_tree::MinSpanningTree;
 use crate::union_find::UnionFind;
 use crate::validation::DataValidator;
+use crate::hyper_parameters::ClusterSelectionMethod;
 use crate::{distance, Center, DistanceMetric, HdbscanError, HdbscanHyperParams};
 use num_traits::Float;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 
 type CondensedTree<T> = Vec<CondensedNode<T>>;
+
+struct ClusteringIntermediates<T> {
+    condensed_tree: Vec<CondensedNode<T>>,
+    winning_clusters: Vec<usize>,
+    labels: Vec<i32>,
+}
 
 /// The HDBSCAN clustering algorithm in Rust. Generic over floating point numeric types.
 #[derive(Debug, Clone, PartialEq)]
@@ -74,12 +82,27 @@ impl<T: Float> Hdbscan<'_, T> {
             PrimsMinSpanningTree::new(self.data, self.hp.dist_metric, &core_distances);
         let min_spanning_tree = mst_calculator.compute();
 
-        let single_linkage_tree = self.make_single_linkage_tree(&min_spanning_tree);
-        let condensed_tree = self.condense_tree(&single_linkage_tree);
-        let winning_clusters = self.extract_winning_clusters(&condensed_tree);
-        let labelled_data = self.label_data(&winning_clusters, &condensed_tree);
+        Ok(self.run_pipeline(&min_spanning_tree).labels)
+    }
 
-        Ok(labelled_data)
+    /// Performs clustering and returns detailed diagnostics including probabilities,
+    /// the condensed tree, and outlier scores.
+    ///
+    /// # Returns
+    /// * An [`HdbscanResult`] containing labels, probabilities, condensed tree, and
+    ///   outlier scores. Supports further analysis via
+    ///   [`all_points_membership_vectors`](HdbscanResult::all_points_membership_vectors).
+    pub fn cluster_detailed(&self) -> Result<HdbscanResult<T>, HdbscanError> {
+        DataValidator::new(self.data, &self.hp).validate_input_data()?;
+
+        let core_dist_calculator = CoreDistanceCalculator::new(self.data, &self.hp);
+        let core_distances = core_dist_calculator.calc_core_distances();
+
+        let mst_calculator =
+            PrimsMinSpanningTree::new(self.data, self.hp.dist_metric, &core_distances);
+        let min_spanning_tree = mst_calculator.compute();
+
+        Ok(self.build_detailed_result(&min_spanning_tree))
     }
 }
 
@@ -133,12 +156,27 @@ impl<T: Float + Send + Sync> Hdbscan<'_, T> {
             PrimsMinSpanningTreePar::new(self.data, self.hp.dist_metric, &core_distances);
         let min_spanning_tree = mst_calculator.compute();
 
-        let single_linkage_tree = self.make_single_linkage_tree(&min_spanning_tree);
-        let condensed_tree = self.condense_tree(&single_linkage_tree);
-        let winning_clusters = self.extract_winning_clusters(&condensed_tree);
-        let labelled_data = self.label_data(&winning_clusters, &condensed_tree);
+        Ok(self.run_pipeline(&min_spanning_tree).labels)
+    }
 
-        Ok(labelled_data)
+    /// Performs parallel clustering and returns detailed diagnostics including
+    /// probabilities, the condensed tree, and outlier scores.
+    ///
+    /// # Returns
+    /// * An [`HdbscanResult`] containing labels, probabilities, condensed tree, and
+    ///   outlier scores. Supports further analysis via
+    ///   [`all_points_membership_vectors`](HdbscanResult::all_points_membership_vectors).
+    pub fn cluster_detailed_par(&self) -> Result<HdbscanResult<T>, HdbscanError> {
+        DataValidator::new(self.data, &self.hp).validate_input_data()?;
+
+        let core_dist_calculator = CoreDistanceCalculatorPar::new(self.data, &self.hp);
+        let core_distances = core_dist_calculator.calc_core_distances();
+
+        let mst_calculator =
+            PrimsMinSpanningTreePar::new(self.data, self.hp.dist_metric, &core_distances);
+        let min_spanning_tree = mst_calculator.compute();
+
+        Ok(self.build_detailed_result(&min_spanning_tree))
     }
 }
 
@@ -288,6 +326,164 @@ impl<'a, T: Float> Hdbscan<'a, T> {
             labels,
             distance::get_dist_func(&self.hp.dist_metric),
         ))
+    }
+
+    fn run_pipeline(&self, mst: &[MSTEdge<T>]) -> ClusteringIntermediates<T> {
+        let single_linkage_tree = self.make_single_linkage_tree(mst);
+        let condensed_tree = self.condense_tree(&single_linkage_tree);
+        let winning_clusters = self.extract_winning_clusters(&condensed_tree);
+        let labels = self.label_data(&winning_clusters, &condensed_tree);
+        ClusteringIntermediates {
+            condensed_tree,
+            winning_clusters,
+            labels,
+        }
+    }
+
+    fn build_detailed_result(&self, mst: &[MSTEdge<T>]) -> HdbscanResult<T> {
+        let intermediates = self.run_pipeline(mst);
+        let death_lambdas = self.compute_death_lambdas(&intermediates.condensed_tree);
+        let probabilities =
+            self.compute_probabilities(&intermediates.labels, &intermediates.condensed_tree);
+        let outlier_scores =
+            self.compute_outlier_scores(&intermediates.condensed_tree, &death_lambdas);
+        HdbscanResult::new(
+            intermediates.labels,
+            probabilities,
+            intermediates.condensed_tree,
+            outlier_scores,
+            intermediates.winning_clusters,
+            death_lambdas,
+            self.n_samples,
+        )
+    }
+
+    fn compute_probabilities(
+        &self,
+        labels: &[i32],
+        condensed_tree: &[CondensedNode<T>],
+    ) -> Vec<T> {
+        // Max lambda per cluster: max lambda_birth among all direct children
+        let mut max_lambda: HashMap<usize, T> = HashMap::new();
+        for node in condensed_tree {
+            let entry = max_lambda.entry(node.parent_node_id).or_insert(T::zero());
+            if node.lambda_birth > *entry {
+                *entry = node.lambda_birth;
+            }
+        }
+
+        // Point info: point -> (parent_cluster, point_lambda)
+        let mut point_info: Vec<(usize, T)> = vec![(0, T::zero()); self.n_samples];
+        for node in condensed_tree {
+            if node.node_id < self.n_samples {
+                point_info[node.node_id] = (node.parent_node_id, node.lambda_birth);
+            }
+        }
+
+        let mut probabilities = vec![T::zero(); self.n_samples];
+        for p in 0..self.n_samples {
+            if labels[p] == -1 {
+                continue;
+            }
+            let (parent_cluster, point_lambda) = point_info[p];
+            let cluster_max = max_lambda.get(&parent_cluster).copied().unwrap_or(T::one());
+            if cluster_max > T::zero() {
+                let capped = if point_lambda < cluster_max {
+                    point_lambda
+                } else {
+                    cluster_max
+                };
+                probabilities[p] = capped / cluster_max;
+            }
+        }
+        probabilities
+    }
+
+    fn compute_death_lambdas(
+        &self,
+        condensed_tree: &[CondensedNode<T>],
+    ) -> HashMap<usize, T> {
+        // Step 1: for each cluster, max lambda_birth among direct children
+        let mut max_child_lambda: HashMap<usize, T> = HashMap::new();
+        for node in condensed_tree {
+            let entry = max_child_lambda
+                .entry(node.parent_node_id)
+                .or_insert(T::zero());
+            if node.lambda_birth > *entry {
+                *entry = node.lambda_birth;
+            }
+        }
+
+        // Step 2: collect all cluster IDs
+        let mut all_cluster_ids: HashSet<usize> = HashSet::new();
+        for node in condensed_tree {
+            if node.node_id >= self.n_samples {
+                all_cluster_ids.insert(node.node_id);
+            }
+            if node.parent_node_id >= self.n_samples {
+                all_cluster_ids.insert(node.parent_node_id);
+            }
+        }
+
+        // Step 3: build child cluster map (parent -> child clusters)
+        let mut cluster_children: HashMap<usize, Vec<usize>> = HashMap::new();
+        for node in condensed_tree {
+            if node.node_id >= self.n_samples {
+                cluster_children
+                    .entry(node.parent_node_id)
+                    .or_default()
+                    .push(node.node_id);
+            }
+        }
+
+        // Step 4: sort descending for bottom-up propagation
+        let mut sorted_ids: Vec<usize> = all_cluster_ids.into_iter().collect();
+        sorted_ids.sort_unstable_by(|a, b| b.cmp(a));
+
+        // Step 5: initialize from max child lambda
+        let mut death_lambdas: HashMap<usize, T> = HashMap::new();
+        for &id in &sorted_ids {
+            death_lambdas.insert(
+                id,
+                max_child_lambda.get(&id).copied().unwrap_or(T::zero()),
+            );
+        }
+
+        // Step 6: propagate bottom-up
+        for &id in &sorted_ids {
+            if let Some(children) = cluster_children.get(&id) {
+                let max_child_death = children
+                    .iter()
+                    .filter_map(|child| death_lambdas.get(child).copied())
+                    .fold(T::zero(), |a, b| if a > b { a } else { b });
+                let current = death_lambdas[&id];
+                if max_child_death > current {
+                    death_lambdas.insert(id, max_child_death);
+                }
+            }
+        }
+
+        death_lambdas
+    }
+
+    fn compute_outlier_scores(
+        &self,
+        condensed_tree: &[CondensedNode<T>],
+        death_lambdas: &HashMap<usize, T>,
+    ) -> Vec<T> {
+        let mut scores = vec![T::zero(); self.n_samples];
+        for node in condensed_tree {
+            if node.node_id < self.n_samples {
+                let death = death_lambdas
+                    .get(&node.parent_node_id)
+                    .copied()
+                    .unwrap_or(T::one());
+                if death > T::zero() {
+                    scores[node.node_id] = (death - node.lambda_birth) / death;
+                }
+            }
+        }
+        scores
     }
 
     fn make_single_linkage_tree(&self, min_spanning_tree: &[MSTEdge<T>]) -> Vec<SLTNode<T>> {
@@ -484,8 +680,25 @@ impl<'a, T: Float> Hdbscan<'a, T> {
     }
 
     fn extract_winning_clusters(&self, condensed_tree: &CondensedTree<T>) -> Vec<usize> {
+        let mut selected_cluster_ids = match self.hp.cluster_selection_method {
+            ClusterSelectionMethod::Eom => self.extract_eom_clusters(condensed_tree),
+            ClusterSelectionMethod::Leaf => self.extract_leaf_clusters(condensed_tree),
+        };
+
         let (lower, upper) = self.get_cluster_id_bounds(condensed_tree);
         let n_clusters = upper - lower;
+
+        if self.hp.epsilon != 0.0 && n_clusters > 0 && !selected_cluster_ids.is_empty() {
+            selected_cluster_ids =
+                self.check_cluster_epsilons(selected_cluster_ids, condensed_tree);
+        }
+
+        selected_cluster_ids.sort();
+        selected_cluster_ids
+    }
+
+    fn extract_eom_clusters(&self, condensed_tree: &CondensedTree<T>) -> Vec<usize> {
+        let (lower, upper) = self.get_cluster_id_bounds(condensed_tree);
 
         let mut stabilities = self.calc_all_stabilities(lower..upper, condensed_tree);
         let mut clusters: HashMap<usize, bool> =
@@ -520,19 +733,34 @@ impl<'a, T: Float> Hdbscan<'a, T> {
             }
         }
 
-        let mut selected_cluster_ids = clusters
+        clusters
             .into_iter()
             .filter(|(_id, should_keep)| *should_keep)
             .map(|(id, _should_keep)| id)
-            .collect();
+            .collect()
+    }
 
-        if self.hp.epsilon != 0.0 && n_clusters > 0 {
-            selected_cluster_ids =
-                self.check_cluster_epsilons(selected_cluster_ids, condensed_tree);
+    fn extract_leaf_clusters(&self, condensed_tree: &CondensedTree<T>) -> Vec<usize> {
+        let mut all_cluster_ids: HashSet<usize> = HashSet::new();
+        let mut parent_cluster_ids: HashSet<usize> = HashSet::new();
+
+        for node in condensed_tree {
+            if node.node_id >= self.n_samples {
+                all_cluster_ids.insert(node.node_id);
+            }
+            if node.parent_node_id >= self.n_samples {
+                all_cluster_ids.insert(node.parent_node_id);
+            }
+            // If a cluster is the parent of another cluster, it's not a leaf
+            if node.node_id >= self.n_samples {
+                parent_cluster_ids.insert(node.parent_node_id);
+            }
         }
 
-        selected_cluster_ids.sort();
-        selected_cluster_ids
+        all_cluster_ids
+            .difference(&parent_cluster_ids)
+            .copied()
+            .collect()
     }
 
     fn get_cluster_id_bounds(&self, condensed_tree: &CondensedTree<T>) -> (usize, usize) {
