@@ -97,7 +97,13 @@ impl<T: Float> HdbscanResult<T> {
                     .get(&cluster_id)
                     .copied()
                     .unwrap_or(T::one());
-                let raw = if death > T::zero() {
+                let raw = if death.is_infinite() {
+                    if merge_lambda.is_infinite() {
+                        T::one()
+                    } else {
+                        T::zero()
+                    }
+                } else if death > T::zero() {
                     merge_lambda / death
                 } else {
                     T::zero()

@@ -387,7 +387,10 @@ impl<'a, T: Float> Hdbscan<'a, T> {
             }
             let (parent_cluster, point_lambda) = point_info[p];
             let cluster_max = max_lambda.get(&parent_cluster).copied().unwrap_or(T::one());
-            if cluster_max > T::zero() {
+            if cluster_max.is_infinite() {
+                // All points merged at distance 0 (duplicates) — maximally connected.
+                probabilities[p] = T::one();
+            } else if cluster_max > T::zero() {
                 let capped = if point_lambda < cluster_max {
                     point_lambda
                 } else {
@@ -478,7 +481,10 @@ impl<'a, T: Float> Hdbscan<'a, T> {
                     .get(&node.parent_node_id)
                     .copied()
                     .unwrap_or(T::one());
-                if death > T::zero() {
+                if death.is_infinite() {
+                    // Points merged at distance 0 (duplicates) — not outliers.
+                    scores[node.node_id] = T::zero();
+                } else if death > T::zero() {
                     scores[node.node_id] = (death - node.lambda_birth) / death;
                 }
             }
